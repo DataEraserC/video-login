@@ -1,99 +1,90 @@
 //! C ABI over `vlogin-core`.
 //!
-//! One entry point, `vlogin_call`, plus the `vlogin_string_free` it hands
-//! ownership to. Both sides speak JSON, which keeps the FFI surface at three
-//! functions and means a host binding is a dozen lines of koffi rather than a
-//! hand-written struct mirror of the whole model.
+//! One entry point, `vlogin_call`, plus `vlogin_version` for diagnostics. Both
+//! sides speak JSON, so the FFI surface stays at two functions and a host binding
+//! is a dozen lines of koffi rather than a hand-written struct mirror of the
+//! whole model.
+//!
+//! ## Memory contract — caller-allocated output
 //!
 //! ```c
-//! char *out = vlogin_call("{\"op\":\"channels\"}");
-//! /* … */
-//! vlogin_string_free(out);
+//! char buf[1 << 20];
+//! int64_t needed = vlogin_call("{\"op\":\"channels\"}", buf, sizeof buf);
 //! ```
 //!
-//! ## Memory contract
+//! The caller owns the output buffer; Rust only writes into it. There is
+//! deliberately **no** `vlogin_string_free`. The obvious alternative —
+//! returning a Rust-allocated C string for the host to free — demands that the
+//! host's allocator and Rust's agree, and every forgetful binding leaks. A
+//! caller-owned buffer has neither problem; the only cost is one extra call if
+//! the first buffer was too small.
 //!
-//! `vlogin_call` returns a malloc'd, NUL-terminated C string owned by the
-//! caller. It must be released with `vlogin_string_free` — freeing it with the
-//! host's own `free` is undefined behaviour, because the Rust allocator and the
-//! host allocator need not agree. Returning JSON Strings (not `*const c_char`
-//! borrows) is what makes that contract expressible.
+//! Return value is always the size the response occupies **including** the
+//! trailing NUL:
+//!
+//! * `> 0` — response length. It was copied into `out` only if it fit;
+//!   otherwise grow the buffer to this size and call again.
+//! * `-1` — `request` was null or not valid UTF-8.
 //!
 //! ## Secrets boundary
 //!
-//! Every response is shaped so that no cookie value ever appears in it. The
-//! only op that returns secret text is `export`, and it is meant for writing
-//! straight into a downloader's cookie file, not for display.
+//! Every response is shaped so no cookie value appears in it. The only op that
+//! returns secret text is `export`, and it exists to be written straight into a
+//! downloader's cookie file, not to be displayed.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::ptr;
 
 use serde_json::{json, Value};
-use vlogin_core::model::AccountStatus;
+use vlogin_core::{Error, Hub, StartRequest};
 
 /// Run one JSON-encoded operation.
 ///
-/// `request` must be a NUL-terminated UTF-8 string. On a malformed request the
-/// response is `{"ok":false,"error":{...}}` rather than a null pointer, so a
-/// host always has something printable.
+/// `request` must be a NUL-terminated UTF-8 string; `out`/`out_len` describe a
+/// caller-owned buffer the JSON response is written into, NUL included.
 ///
 /// # Safety
 ///
-/// `request` must be a valid pointer to a NUL-terminated C string, or null (in
-/// which case an error response is returned).
+/// `request` must be a valid pointer to a NUL-terminated C string (or null).
+/// `out` must be null or point to at least `out_len` writable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn vlogin_call(request: *const c_char) -> *mut c_char {
-    let text = if request.is_null() {
-        return to_ptr(error_response("abi", "null request pointer"));
-    } else {
-        match CStr::from_ptr(request).to_str() {
-            Ok(value) => value.to_string(),
-            Err(_) => return to_ptr(error_response("abi", "request is not valid UTF-8")),
-        }
+pub unsafe extern "C" fn vlogin_call(
+    request: *const c_char,
+    out: *mut c_char,
+    out_len: u64,
+) -> i64 {
+    if request.is_null() {
+        return -1;
+    }
+    let text = match CStr::from_ptr(request).to_str() {
+        Ok(value) => value,
+        Err(_) => return -1,
     };
 
-    let response = match serde_json::from_str::<Value>(&text) {
-        Ok(request) => dispatch(&request),
+    let response = match serde_json::from_str::<Value>(text) {
+        Ok(parsed) => dispatch(&parsed),
         Err(error) => error_response("bad_request", &error.to_string()),
     };
-    to_ptr(response)
-}
 
-/// Release a string returned by [`vlogin_call`]. Accepts null.
-///
-/// # Safety
-///
-/// The pointer must have come from `vlogin_call` and must not be freed twice.
-#[no_mangle]
-pub unsafe extern "C" fn vlogin_string_free(value: *mut c_char) {
-    if value.is_null() {
-        return;
+    let encoded = response.to_string();
+    // +1 for the NUL terminator.
+    let needed = encoded.len() + 1;
+    if !out.is_null() && needed <= out_len as usize {
+        let bytes = encoded.as_bytes();
+        ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len());
+        *out.add(bytes.len()) = 0;
     }
-    drop(CString::from_raw(value));
+    needed as i64
 }
 
 /// Library version, for host diagnostics.
 ///
-/// # Safety
-///
-/// Takes no arguments; the returned pointer must be freed with
-/// [`vlogin_string_free`].
+/// Points at a `'static` array, so the pointer stays valid forever and must
+/// **not** be freed.
 #[no_mangle]
-pub unsafe extern "C" fn vlogin_version() -> *mut c_char {
-    to_ptr(json!({ "ok": true, "result": env!("CARGO_PKG_VERSION") }))
-}
-
-/// Hand a JSON value back to C as an owned C string.
-fn to_ptr(value: Value) -> *mut c_char {
-    match CString::new(value.to_string()) {
-        Ok(text) => text.into_raw(),
-        Err(_) => {
-            // `to_string()` never emits NUL for the values we build, so this
-            // is a defensive branch rather than an expected one.
-            ptr::null_mut()
-        }
-    }
+pub extern "C" fn vlogin_version() -> *const c_char {
+    b"0.1.0\0".as_ptr() as *const c_char
 }
 
 /// A failed operation, tagged with a stable machine-readable `kind`.
@@ -107,47 +98,75 @@ fn ok(result: Value) -> Value {
 }
 
 /// Route one request to its handler.
+///
+/// ## Ops
+///
+/// * `channels` — every advertised channel, with display name and methods.
+/// * `route`    — `{ url }` → `{ channel }`: which channel owns that URL.
+/// * `status`   — every channel with its account pool and pinned account id.
+/// * `accounts` — `{ channel }` → that channel's accounts, pinned first.
+/// * `start`    — `{ channel, method, params?, label? }` → `{ session_id, challenge }`.
+/// * `browse`   — `{ channel }` → `{ session_id, challenge }` (real browser).
+/// * `poll`     — `{ sessionId }` → `{ result, account? }`.
+/// * `submit`   — `{ sessionId, params }` → `{ result, account? }`.
+/// * `import`   — `{ channel, cookies, label? }` → `{ account }`.
+/// * `check`    — `{ channel, account? }` → `{ account }` (probes the site).
+/// * `pin`      — `{ channel, account }` → `{ account }`.
+/// * `logout`   — `{ channel, account }` → `{ removed }`.
+/// * `clear`    — `{ channel }` → `{ removed }`.
+/// * `cancel`   — `{ sessionId }` → `{ cancelled }`.
+/// * `export`   — `{ channel, account? }` → `{ cookies }`. SECRET: the only
+///   response carrying cookie text.
+/// * `materialize` — `{ channel, account? }` → `{ path }` of a 0600 cookie file.
+/// * `sweep`  — deletes expired login sessions.
+///
+/// The closure wrapper is what lets every arm use `?` for both the core's own
+/// errors and `serde_json`'s while agreeing on one return type.
 fn dispatch(request: &Value) -> Value {
     let op = match request.get("op").and_then(|v| v.as_str()) {
         Some(op) => op,
         None => return error_response("bad_request", "missing 'op'"),
     };
 
-    let result = (|| -> vlogin_core::Result<Value> {
+    let result = (|| -> Result<Value, Error> {
         match op {
             "channels" => {
-                let hub = vlogin_core::Hub::open_default()?;
+                let hub = Hub::open_default()?;
                 Ok(serde_json::to_value(hub.site_channels())?)
             }
+            "route" => {
+                let url = require_string(request, "url")?;
+                let hub = Hub::open_default()?;
+                Ok(json!({ "channel": hub.channel_for_url(&url) }))
+            }
             "status" => {
-                let hub = vlogin_core::Hub::open_default()?;
+                let hub = Hub::open_default()?;
                 Ok(serde_json::to_value(hub.statuses())?)
             }
             "accounts" => {
                 let channel = require_channel(request)?;
-                let hub = vlogin_core::Hub::open_default()?;
+                let hub = Hub::open_default()?;
                 Ok(serde_json::to_value(hub.accounts(&channel)?)?)
             }
             "start" => {
-                let start: vlogin_core::StartRequest =
-                    serde_json::from_value(request.clone())?;
-                let hub = vlogin_core::Hub::open_default()?;
+                let start: StartRequest = serde_json::from_value(request.clone())?;
+                let hub = Hub::open_default()?;
                 Ok(serde_json::to_value(hub.start(&start)?)?)
             }
             "browse" => {
                 let channel = require_channel(request)?;
-                let hub = vlogin_core::Hub::open_default()?;
+                let hub = Hub::open_default()?;
                 Ok(serde_json::to_value(hub.browse(&channel)?)?)
             }
             "poll" => {
                 let session_id = require_string(request, "sessionId")?;
-                let hub = vlogin_core::Hub::open_default()?;
+                let hub = Hub::open_default()?;
                 Ok(serde_json::to_value(hub.poll(&session_id)?)?)
             }
             "submit" => {
                 let session_id = require_string(request, "sessionId")?;
                 let params = request.get("params").cloned().unwrap_or(Value::Null);
-                let hub = vlogin_core::Hub::open_default()?;
+                let hub = Hub::open_default()?;
                 Ok(serde_json::to_value(hub.submit(&session_id, &params)?)?)
             }
             "import" => {
@@ -156,57 +175,60 @@ fn dispatch(request: &Value) -> Value {
                     require_string_optional(request, "method").unwrap_or_else(|| "manual".into());
                 let cookies = require_string(request, "cookies")?;
                 let label = require_string_optional(request, "label").unwrap_or_default();
-                let hub = vlogin_core::Hub::open_default()?;
+                let hub = Hub::open_default()?;
                 let view = hub.import(&channel, &method, &cookies, &label)?;
                 Ok(serde_json::to_value(view)?)
             }
             "check" => {
                 let channel = require_channel(request)?;
                 let account = require_string_optional(request, "account");
-                let hub = vlogin_core::Hub::open_default()?;
+                let hub = Hub::open_default()?;
                 let view = hub.status(&channel, account.as_deref())?;
                 Ok(serde_json::to_value(view)?)
             }
             "pin" => {
                 let channel = require_channel(request)?;
                 let account = require_string(request, "account")?;
-                let hub = vlogin_core::Hub::open_default()?;
+                let hub = Hub::open_default()?;
                 Ok(serde_json::to_value(hub.pin(&channel, &account)?)?)
             }
             "logout" => {
                 let channel = require_channel(request)?;
                 let account = require_string(request, "account")?;
-                let hub = vlogin_core::Hub::open_default()?;
-                Ok(json!({ "removed": hub.logout(&channel, &account)? }))
+                let hub = Hub::open_default()?;
+                // Bare bool, not `{ removed: bool }`: the ABI envelope already
+                // is the wrapper, so a second one would nest and every host
+                // binding would have to know to unwrap twice.
+                Ok(json!(hub.logout(&channel, &account)?))
             }
             "clear" => {
                 let channel = require_channel(request)?;
-                let hub = vlogin_core::Hub::open_default()?;
-                Ok(json!({ "removed": hub.clear(&channel)? }))
+                let hub = Hub::open_default()?;
+                Ok(json!(hub.clear(&channel)?))
             }
             "export" => {
                 let channel = require_channel(request)?;
                 let account = require_string_optional(request, "account");
-                let hub = vlogin_core::Hub::open_default()?;
+                let hub = Hub::open_default()?;
                 Ok(json!({ "cookies": hub.export(&channel, account.as_deref())? }))
             }
             "materialize" => {
                 let channel = require_channel(request)?;
                 let account = require_string_optional(request, "account");
-                let hub = vlogin_core::Hub::open_default()?;
+                let hub = Hub::open_default()?;
                 Ok(json!({ "path": hub.materialize(&channel, account.as_deref())? }))
             }
             "cancel" => {
                 let session_id = require_string(request, "sessionId")?;
-                let hub = vlogin_core::Hub::open_default()?;
+                let hub = Hub::open_default()?;
                 hub.cancel(&session_id)?;
                 Ok(json!({ "cancelled": true }))
             }
             "sweep" => {
-                let hub = vlogin_core::Hub::open_default()?;
+                let hub = Hub::open_default()?;
                 Ok(json!({ "swept": hub.sweep()? }))
             }
-            other => Err(vlogin_core::Error::channel(format!("unknown op '{other}'"))),
+            other => Err(Error::channel(format!("unknown op '{other}'"))),
         }
     })();
 
@@ -217,43 +239,32 @@ fn dispatch(request: &Value) -> Value {
 }
 
 /// Map an error onto the stable `kind` string hosts switch on.
-fn error_kind(error: &vlogin_core::Error) -> &'static str {
+fn error_kind(error: &Error) -> &'static str {
     match error {
-        vlogin_core::Error::Channel(_) => "channel",
-        vlogin_core::Error::Cookie(_) => "cookie",
-        vlogin_core::Error::Http(_) => "http",
-        vlogin_core::Error::Io(_) => "io",
-        vlogin_core::Error::Json(_) => "json",
-        vlogin_core::Error::Other(_) => "other",
+        Error::Channel(_) => "channel",
+        Error::Cookie(_) => "cookie",
+        Error::Http(_) => "http",
+        Error::Io(_) => "io",
+        Error::Json(_) => "json",
+        Error::Other(_) => "other",
     }
 }
 
-/// Read the `channel` field.
-fn require_channel(request: &Value) -> vlogin_core::Result<String> {
+/// Read the `channel` field, which most ops carry.
+fn require_channel(request: &Value) -> Result<String, Error> {
     require_string(request, "channel")
 }
 
 /// Read a required string field.
-fn require_string(request: &Value, key: &str) -> vlogin_core::Result<String> {
+fn require_string(request: &Value, key: &str) -> Result<String, Error> {
     request
         .get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| vlogin_core::Error::channel(format!("missing '{key}'")))
+        .ok_or_else(|| Error::channel(format!("missing '{key}'")))
 }
 
 /// Read an optional string field.
 fn require_string_optional(request: &Value, key: &str) -> Option<String> {
     request.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
-}
-
-/// Human labels for account status, so hosts need no lookup table.
-#[allow(dead_code)]
-fn status_label(status: AccountStatus) -> &'static str {
-    match status {
-        AccountStatus::Unknown => "unknown",
-        AccountStatus::Active => "active",
-        AccountStatus::Expired => "expired",
-        AccountStatus::Unreachable => "unreachable",
-    }
 }
