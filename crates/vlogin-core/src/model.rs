@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// Global method dimension. Reserved values are advertised by every channel so
 /// a host can render a complete picker and get a typed refusal when it asks a
 /// channel for something it does not implement.
-pub const ALL_METHODS: &[&str] = &["qr", "manual", "sms", "password", "browser"];
+pub const ALL_METHODS: &[&str] = &["qr", "manual", "sms", "password", "browser", "oauth"];
 
 /// Which login surface a method drives, so a host knows what to render without
 /// hard-coding method names.
