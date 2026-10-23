@@ -1,0 +1,7 @@
+/target
+/result
+/result-*
+*.jar.txt
+/cookies/
+/accounts/
+/sessions/

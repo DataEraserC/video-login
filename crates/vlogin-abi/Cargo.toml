@@ -1,0 +1,17 @@
+[package]
+name = "vlogin-abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C ABI over vlogin-core: one JSON call in, one JSON string out"
+
+[lib]
+# Fixed to the on-disk library name: `libvlogin.so`. A cdylib keeps the
+# surface C-callable from koffi/ctypes/FFI without a second wrapper crate.
+name = "vlogin"
+crate-type = ["cdylib"]
+
+[dependencies]
+vlogin-core = { path = "../vlogin-core" }
+serde_json = "1"
