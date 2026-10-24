@@ -65,8 +65,13 @@ still fail at fetch time — worse than not offering it.
 
 ## Storage
 
-Everything lives under one root (`$VLOGIN_ROOT`, else `$XDG_STATE_HOME/vlogin`,
-else `~/.local/state/vlogin`):
+Everything lives under one root (`$VLOGIN_HOME`, else
+`$XDG_DATA_HOME/video-login`, else `~/.local/share/video-login`):
+
+The core knows none of its callers — not dsh, not the CLI. A harness that
+keeps its state somewhere else exports that into `VLOGIN_HOME` before its first
+call; the dsh plugin sets it to `$DSH_HOME/video-fetch`. Without one, the root
+above applies, so the CLI and a Python script get the same default.
 
 ```
 accounts/<channel>.json     account pool: labels, active pin, metadata

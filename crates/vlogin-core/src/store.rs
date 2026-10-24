@@ -44,15 +44,17 @@ pub const MAX_ACCOUNTS: usize = 10;
 
 /// Resolve the state root.
 ///
-/// Precedence: `$VLOGIN_HOME` → `$DSH_HOME/video-fetch` (keeps existing dsh
-/// installs pointed at their current jars) → `$XDG_DATA_HOME/video-login` →
+/// Precedence: `$VLOGIN_HOME` → `$XDG_DATA_HOME/video-login` →
 /// `~/.local/share/video-login`.
+///
+/// This crate is harness-independent and has to stay that way, so it knows
+/// nothing about `DSH_HOME`. A harness that keeps its state somewhere else
+/// (dsh keeps it in `$DSH_HOME/video-fetch`) exports that into `VLOGIN_HOME`
+/// before the first call; the older preference for `$DSH_HOME` is what made
+/// the "no harness assumed" claim conditional on an environment variable.
 pub fn default_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("VLOGIN_HOME") {
         return PathBuf::from(dir);
-    }
-    if let Some(dsh) = std::env::var_os("DSH_HOME") {
-        return Path::new(&dsh).join("video-fetch");
     }
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
